@@ -13,6 +13,25 @@ import os
 import sys
 import urllib.parse
 
+# ══ 延迟 / 速度可调项 ═════════════════════════════════════════════
+# 想调延迟和速度，改这一块就够，改完重跑一次 workflow。
+#
+# 最有效的杠杆是 PORTS：先在客户端把 7 个端口各测一次真实带宽，
+# 选出最快的一两个后，把 PORTS 删到只剩它们。节点数会从 57 降到 8~16，
+# 自动测速每轮要并发探测的节点少一大截，节点抖动也跟着小。
+#
+# ENABLE_V6：没有 IPv6 网络就改成 False。会去掉 28 个 v6 节点并关掉
+#   配置里的 ipv6。没 v6 的线路上这些节点会先握手超时才回落，拖慢首次连接。
+ENABLE_V6 = True
+# MTU：默认 1280（Cloudflare 官方值）。如果延迟高的同时伴随卡顿、丢包，
+#   往下调试试，比如 1200。
+MTU = 1280
+# REMOTE_DNS：True = DNS 在隧道远端解析（抗污染，但每个新域名多一次隧道往返，
+#   网页首开偏慢）。想改成 False 交给本地 DNS——配置里国内/国外 DNS 已经分开，
+#   代价是国外域名可能解析到离你更近、但未必是 WARP 出口附近的节点。
+REMOTE_DNS = True
+# ════════════════════════════════════════════════════════════════
+
 # 全部经真机握手实测（2026-09-05，psg2）
 # QUIC 回包不等于能建隧道：162.159.194/196/197/204 段与 v6 的 102/105 段
 # 会回包但 login 失败，已剔除。
@@ -21,6 +40,12 @@ V6 = ["2606:4700:103::1", "2606:4700:103::2",
       "2606:4700:104::1", "2606:4700:104::2"]
 # 4443/8095 是后来补测出来的，实测 8/8 全通
 PORTS = (443, 500, 1701, 4500, 4443, 8443, 8095)
+
+
+def endpoints():
+    """实际要生成的接入地址。关掉 IPv6 时直接不生成 v6 节点。"""
+    return V4 + (V6 if ENABLE_V6 else [])
+
 
 # CF 没有 A 记录指向 MASQUE 段，官方域名只能用在 SNI 上
 OFFICIAL_SNI = "zt-masque.cloudflareclient.com"
@@ -100,6 +125,9 @@ def node(name, ip, port, priv, pub, v4, v6, sni=None):
     # 裸 IPv6 含冒号，YAML 里必须加引号否则被解析成映射
     srv = f'"{ip}"' if ":" in ip else ip
     extra = f"\n    sni: {sni}" if sni else ""
+    # 关掉 IPv6 时不要把 v6 DNS 写进去，否则远端解析会先等它超时
+    dns = "1.1.1.1, 2606:4700:4700::1111" if ENABLE_V6 else "1.1.1.1"
+    remote = f"\n    dns: [{dns}]" if REMOTE_DNS else ""
     return f"""  - name: {name}
     type: masque
     server: {srv}
@@ -108,10 +136,9 @@ def node(name, ip, port, priv, pub, v4, v6, sni=None):
     public-key: {pub}
     ip: {v4}
     ipv6: {v6}
-    mtu: 1280
+    mtu: {MTU}
     udp: true
-    remote-dns-resolve: true
-    dns: [1.1.1.1, 2606:4700:4700::1111]"""
+    remote-dns-resolve: {str(REMOTE_DNS).lower()}{remote}"""
 
 
 def node_name(ip, port):
@@ -134,7 +161,7 @@ def masque_links(cfg, priv, pub):
         return urllib.parse.quote(str(v), safe="").replace("%2C", ",")
 
     lines = []
-    for ip in V4 + V6:
+    for ip in endpoints():
         for port in PORTS:
             params = "&".join([
                 "publicKey=" + enc(pub),
@@ -159,7 +186,7 @@ def build(cfg):
     v4, v6 = cfg["ipv4"], cfg["ipv6"]
 
     names, proxies = [], []
-    for ip in V4 + V6:
+    for ip in endpoints():
         for port in PORTS:
             name = node_name(ip, port)
             names.append(name)
@@ -194,12 +221,13 @@ def build(cfg):
 #
 # 节点 {len(names)} 个，endpoint 均经真机握手实测。
 # private-key 等同账号凭据。
+# 延迟/速度调参见本脚本顶部「延迟 / 速度可调项」。
 
 mixed-port: 7890
 allow-lan: false
 mode: rule
 log-level: info
-ipv6: true
+ipv6: {str(ENABLE_V6).lower()}
 unified-delay: true
 tcp-concurrent: true
 find-process-mode: 'off'
@@ -226,7 +254,7 @@ sniffer:
 dns:
   enable: true
   listen: 0.0.0.0:1053
-  ipv6: true
+  ipv6: {str(ENABLE_V6).lower()}
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   fake-ip-filter:
@@ -272,7 +300,7 @@ proxy-groups:
     url: http://www.gstatic.com/generate_204
     interval: 300
     tolerance: 50
-    lazy: false
+    lazy: true
     proxies:
 {ind(names)}
 
